@@ -19,6 +19,14 @@ on:
         description: "Student branch name"
         required: true
         type: string
+      attempt_token:
+        description: "GitHub dispatch token from platform"
+        required: true
+        type: string
+      student_repository:
+        description: "Student repository URL"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -26,6 +34,9 @@ permissions:
 jobs:
   evaluate:
     runs-on: ubuntu-latest
+    env:
+      ACADEMY_URL: ${{ secrets.ACADEMY_URL }}
+      CALLBACK_SECRET: ${{ secrets.GITHUB_EXERCISE_CALLBACK_SECRET }}
 
     steps:
       - name: Checkout submitted branch
@@ -249,6 +260,54 @@ jobs:
           path: |
             evaluation-results/result.json
             evaluation-results/full-output.txt
+
+      - name: Send evaluation callback
+        if: always()
+        env:
+          ATTEMPT_TOKEN: ${{ github.event.inputs.attempt_token }}
+          STUDENT_REPOSITORY: ${{ github.event.inputs.student_repository }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import hmac
+          import json
+          import os
+          import urllib.request
+          from pathlib import Path
+
+          result_path = Path("evaluation-results/result.json")
+          payload = {
+              "attempt_token": os.environ["ATTEMPT_TOKEN"],
+              "student_repository": os.environ["STUDENT_REPOSITORY"],
+          }
+
+          if result_path.exists():
+              payload.update(json.loads(result_path.read_text(encoding="utf-8")))
+
+          body = json.dumps(payload).encode("utf-8")
+          url = f"{os.environ['ACADEMY_URL']}/api/exercises/github-callback"
+          signature = hmac.new(
+              os.environ["CALLBACK_SECRET"].encode("utf-8"),
+              body,
+              hashlib.sha256,
+          ).hexdigest()
+
+          request = urllib.request.Request(
+              url,
+              data=body,
+              headers={
+                  "Content-Type": "application/json",
+                  "X-Academy-Signature": f"sha256={signature}",
+              },
+              method="POST",
+          )
+
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  print(f"Callback status: {response.status}")
+          except Exception as exc:
+              print(f"Callback failed: {exc}")
+          PY
 
       - name: Fail workflow if evaluation failed
         if: steps.evaluation.outputs.eval_status != 'passed'

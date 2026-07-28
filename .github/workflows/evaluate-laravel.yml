@@ -4,27 +4,27 @@ on:
   workflow_dispatch:
     inputs:
       submission_id:
-        description: "Submission ID from Laravel platform"
+        description: 'Submission ID from Laravel platform'
         required: true
         type: string
       exercise_slug:
-        description: "Exercise slug"
+        description: 'Exercise slug'
         required: true
         type: string
       test_suite:
-        description: "Hidden test suite key"
+        description: 'Hidden test suite key'
         required: true
         type: string
       student_branch:
-        description: "Student branch name"
+        description: 'Student branch name'
         required: true
         type: string
       attempt_token:
-        description: "GitHub dispatch token from platform"
+        description: 'GitHub dispatch token from platform'
         required: true
         type: string
       student_repository:
-        description: "Student repository URL"
+        description: 'Student repository URL'
         required: true
         type: string
 

@@ -1,4 +1,4 @@
-name: Evaluate Laravel Submission
+name: Evaluate Laravel Exercise Submission
 
 on:
   workflow_dispatch:
@@ -92,7 +92,7 @@ jobs:
         run: |
           php artisan test --testdox --json=test-results.json > test-output.txt 2>&1 || true
 
-            - name: Process test results
+      - name: Process test results
         id: results
         run: |
           php <<'EOF'
@@ -148,12 +148,7 @@ jobs:
           ];
 
           file_put_contents('evaluation-results.json', json_encode($results, JSON_PRETTY_PRINT));
-          echo "score={$results['score']}\n";
-          echo "passed=" . ($results['passed'] ? 'true' : 'false') . "\n";
           EOF
-        shell: bash
-        env:
-          GITHUB_OUTPUT: $GITHUB_OUTPUT
 
       - name: Upload result artifact
         if: always()
@@ -184,13 +179,16 @@ jobs:
           JSON
           )
           signature="sha256=$(printf '%s' "$payload" | openssl dgst -sha256 -hmac "${CALLBACK_SECRET}" | sed 's/^.*= //')"
+
           response=$(curl -sS -w "%{http_code}" -o /tmp/callback-response.txt \
             -X POST "${ACADEMY_URL}/api/exercises/github-callback" \
             -H "Content-Type: application/json" \
             -H "X-Academy-Signature: $signature" \
             --data "$payload")
+
           echo "callback_status=$response"
           echo "callback_body=$(cat /tmp/callback-response.txt)"
+
           if [ "$response" -lt 200 ] || [ "$response" -ge 300 ]; then
             echo "Callback failed: $(cat /tmp/callback-response.txt)"
             exit 1

@@ -1,4 +1,4 @@
-name: Evaluate Laravel Exercise Submission
+name: Evaluate Laravel Submission
 
 on:
   workflow_dispatch:
@@ -34,6 +34,12 @@ permissions:
 env:
   ACADEMY_URL: ${{ secrets.ACADEMY_URL }}
   CALLBACK_SECRET: ${{ secrets.GITHUB_EXERCISE_CALLBACK_SECRET }}
+  STUDENT_REPOSITORY: ${{ github.event.inputs.student_repository }}
+  STUDENT_BRANCH: ${{ github.event.inputs.student_branch }}
+  ATTEMPT_TOKEN: ${{ github.event.inputs.attempt_token }}
+  SUBMISSION_ID: ${{ github.event.inputs.submission_id }}
+  TEST_SUITE: ${{ github.event.inputs.test_suite }}
+  EXERCISE_SLUG: ${{ github.event.inputs.exercise_slug }}
 
 jobs:
   evaluate:
@@ -49,19 +55,19 @@ jobs:
         id: parse_repo
         shell: bash
         run: |
-          if [[ "${{ github.event.inputs.student_repository }}" =~ ^https://github\.com/([^/]+)/([^/]+)(\.git)?$ ]]; then
+          if [[ "${STUDENT_REPOSITORY}" =~ ^https://github\.com/([^/]+)/([^/]+)(\.git)?$ ]]; then
             echo "owner=${BASH_REMATCH[1]}" >> $GITHUB_OUTPUT
-            echo "repository=${BASH_REMATCH[2]}" >> $GITHUB_OUTPUT
+            echo "repo=${BASH_REMATCH[2]}" >> $GITHUB_OUTPUT
           else
-            echo "Invalid GitHub repository URL: ${{ github.event.inputs.student_repository }}"
+            echo "Invalid GitHub repository URL: ${STUDENT_REPOSITORY}"
             exit 1
           fi
 
       - name: Checkout student submission
         uses: actions/checkout@v4
         with:
-          repository: ${{ steps.parse_repo.outputs.owner }}/${{ steps.parse_repo.outputs.repository }}
-          ref: ${{ github.event.inputs.student_branch }}
+          repository: ${{ steps.parse_repo.outputs.owner }}/${{ steps.parse_repo.outputs.repo }}
+          ref: ${{ env.STUDENT_BRANCH }}
           path: student-submission
 
       - name: Setup PHP
@@ -148,7 +154,11 @@ jobs:
           ];
 
           file_put_contents('evaluation-results.json', json_encode($results, JSON_PRETTY_PRINT));
+          echo "score={$results['score']}\n";
+          echo "passed=" . ($results['passed'] ? 'true' : 'false') . "\n";
           EOF
+          echo "score=$(php -r 'echo json_decode(file_get_contents(\"evaluation-results.json\"), true)[\"score\"];')" >> $GITHUB_OUTPUT
+          echo "passed=$(php -r 'echo json_decode(file_get_contents(\"evaluation-results.json\"), true)[\"passed\"] ? \"true\" : \"false\";')" >> $GITHUB_OUTPUT
 
       - name: Upload result artifact
         if: always()
@@ -164,35 +174,50 @@ jobs:
         if: always()
         shell: bash
         run: |
-          payload=$(cat <<'JSON'
-          {
-            "attempt_token": "${{ github.event.inputs.attempt_token }}",
-            "status": "completed",
-            "score": $(php -r 'echo json_decode(file_get_contents("evaluation-results.json"), true)["score"];'),
-            "passed": $(php -r 'echo json_encode(json_decode(file_get_contents("evaluation-results.json"), true)["passed"]);'),
-            "feedback": {
-              "earned_points": $(php -r 'echo json_decode(file_get_contents("evaluation-results.json"), true)["score"];'),
-              "total_points": 100,
-              "checks": $(php -r 'echo json_encode(json_decode(file_get_contents("evaluation-results.json"), true)["checks"]);')
-            }
+          php <<'EOF'
+          <?php
+          $results = json_decode(file_get_contents('evaluation-results.json'), true);
+          $payload = json_encode([
+              'attempt_token' => getenv('ATTEMPT_TOKEN'),
+              'status' => 'completed',
+              'score' => $results['score'],
+              'passed' => $results['passed'],
+              'feedback' => [
+                  'earned_points' => $results['score'],
+                  'total_points' => 100,
+                  'checks' => $results['checks'],
+              ],
+          ], JSON_UNESCAPED_SLASHES);
+
+          $secret = getenv('CALLBACK_SECRET');
+          $signature = 'sha256=' . hash_hmac('sha256', $payload, $secret);
+
+          $ch = curl_init(getenv('ACADEMY_URL') . '/api/exercises/github-callback');
+          curl_setopt_array($ch, [
+              CURLOPT_RETURNTRANSFER => true,
+              CURLOPT_POST => true,
+              CURLOPT_POSTFIELDS => $payload,
+              CURLOPT_HTTPHEADER => [
+                  'Content-Type: application/json',
+                  'X-Academy-Signature: ' . $signature,
+              ],
+          ]);
+
+          $response = curl_exec($ch);
+          $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+          $error = curl_error($ch);
+          curl_close($ch);
+
+          if ($error) {
+              fwrite(STDERR, $error . \"\n\");
+              exit(1);
           }
-          JSON
-          )
-          signature="sha256=$(printf '%s' "$payload" | openssl dgst -sha256 -hmac "${CALLBACK_SECRET}" | sed 's/^.*= //')"
 
-          response=$(curl -sS -w "%{http_code}" -o /tmp/callback-response.txt \
-            -X POST "${ACADEMY_URL}/api/exercises/github-callback" \
-            -H "Content-Type: application/json" \
-            -H "X-Academy-Signature: $signature" \
-            --data "$payload")
-
-          echo "callback_status=$response"
-          echo "callback_body=$(cat /tmp/callback-response.txt)"
-
-          if [ "$response" -lt 200 ] || [ "$response" -ge 300 ]; then
-            echo "Callback failed: $(cat /tmp/callback-response.txt)"
-            exit 1
-          fi
+          echo $response;
+          if ($code < 200 || $code >= 300) {
+              exit(1);
+          }
+          EOF
 
       - name: Fail workflow if evaluation failed
         if: always() && steps.results.outputs.passed != 'true'

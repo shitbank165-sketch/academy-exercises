@@ -33,7 +33,7 @@ permissions:
 
 env:
   ACADEMY_URL: ${{ secrets.ACADEMY_URL }}
-  CALLBACK_SECRET: ${{ secrets.GITHUB_EXERCISE_CALLBACK_SECRET }}
+  CALLBACK_SECRET: ${{ secrets.ACADEMY_CALLBACK_SECRET }}
   STUDENT_REPOSITORY: ${{ github.event.inputs.student_repository }}
   STUDENT_BRANCH: ${{ github.event.inputs.student_branch }}
   ATTEMPT_TOKEN: ${{ github.event.inputs.attempt_token }}
@@ -147,7 +147,7 @@ jobs:
           $results = [
               'score' => $score,
               'passed' => $testsPassed,
-              'checks' => $checks ?: [
+              'feedback' => $checks ?: [
                   [
                       'language' => 'php',
                       'passed' => $testsPassed,
@@ -162,7 +162,7 @@ jobs:
           EOF
 
           echo "score=$(php -r 'echo json_decode(file_get_contents(\"evaluation-results.json\"), true)[\"score\"];')" >> "$GITHUB_OUTPUT"
-          echo "passed=$(php -r 'echo json_decode(file_get_contents(\"evaluation-results.json\"), true)[\"passed\"] ? \"true\" : \"false\";')" >> "$GITHUB_OUTPUT"
+          echo "passed=$(php -r 'echo json_decode(file_get_contents(\"evaluation-results.json\", true)[\"passed\"] ? \"true\" : \"false\";')" >> "$GITHUB_OUTPUT"
 
       - name: Upload result artifact
         if: always()
@@ -178,34 +178,31 @@ jobs:
         if: always()
         working-directory: student-submission
         shell: bash
+        env:
+          ACADEMY_URL: ${{ secrets.ACADEMY_URL }}
+          CALLBACK_SECRET: ${{ secrets.ACADEMY_CALLBACK_SECRET }}
+          ATTEMPT_TOKEN: ${{ github.event.inputs.attempt_token }}
         run: |
-          payload=$(cat <<'JSON'
-          {
-            "attempt_token": "${ATTEMPT_TOKEN}",
-            "status": "completed",
-            "score": $(php -r 'echo json_decode(file_get_contents("evaluation-results.json"), true)["score"];'),
-            "passed": $(php -r 'echo json_encode(json_decode(file_get_contents("evaluation-results.json"), true)["passed"]);'),
-            "feedback": {
-              "earned_points": $(php -r 'echo json_decode(file_get_contents("evaluation-results.json"), true)["score"];'),
-              "total_points": 100,
-              "checks": $(php -r 'echo json_encode(json_decode(file_get_contents("evaluation-results.json"), true)["checks"]);')
-            }
-          }
-          JSON
+          payload=$(jq -c \
+            --arg attempt_token "$ATTEMPT_TOKEN" \
+            --arg status "completed" \
+            '. + {attempt_token: $attempt_token, status: $status}' \
+            evaluation-results.json
           )
 
-          signature="sha256=$(printf '%s' "$payload" | openssl dgst -sha256 -hmac "${CALLBACK_SECRET}" | sed 's/^.*= //')"
-          response=$(curl -sS -w "%{http_code}" -o /tmp/callback-response.txt \
-            -X POST "${ACADEMY_URL}/api/exercises/github-callback" \
+          signature="sha256=$(printf '%s' "$payload" | openssl dgst -sha256 -hmac "$CALLBACK_SECRET" | sed 's/^.*= //')"
+
+          http_status=$(curl -sS -o /tmp/callback-response.txt -w '%{http_code}' \
+            -X POST "$ACADEMY_URL/api/exercises/github-callback" \
             -H "Content-Type: application/json" \
             -H "X-Academy-Signature: $signature" \
-            --data "$payload")
+            --data-binary "$payload")
 
-          echo "callback_status=$response"
-          echo "callback_body=$(cat /tmp/callback-response.txt)"
+          echo "callback_status=$http_status"
+          cat /tmp/callback-response.txt
 
-          if [ "$response" -lt 200 ] || [ "$response" -ge 300 ]; then
-            echo "Callback failed: $(cat /tmp/callback-response.txt)"
+          if [ "$http_status" -lt 200 ] || [ "$http_status" -ge 300 ]; then
+            echo "Callback failed with status $http_status"
             exit 1
           fi
 

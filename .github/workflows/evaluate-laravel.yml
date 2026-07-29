@@ -92,7 +92,7 @@ jobs:
         run: |
           php artisan test --testdox --json=test-results.json > test-output.txt 2>&1 || true
 
-      - name: Process test results
+            - name: Process test results
         id: results
         run: |
           php <<'EOF'
@@ -102,6 +102,7 @@ jobs:
           $passed = 0;
           $failed = 0;
           $checks = [];
+
           if (file_exists($jsonFile)) {
               $results = json_decode(file_get_contents($jsonFile), true);
               foreach ($results['tests'] ?? [] as $test) {
@@ -117,32 +118,42 @@ jobs:
                   }
               }
           }
-          $output = file_exists($textFile) ? file_get_contents($textFile) : '';
-          if (preg_match('/(\\d+) passed/', $output, $m)) {
-              $passed = (int) $m[1];
+
+          if (file_exists($textFile)) {
+              $output = file_get_contents($textFile);
+              if (preg_match('/(\d+) passed/', $output, $m)) {
+                  $passed = (int) $m[1];
+              }
+              if (preg_match('/(\d+) failed/', $output, $m)) {
+                  $failed = (int) $m[1];
+              }
           }
-          if (preg_match('/(\\d+) failed/', $output, $m)) {
-              $failed = (int) $m[1];
-          }
+
           $total = max(1, $passed + $failed);
           $score = (int) (($passed / $total) * 100);
           $testsPassed = $failed === 0 && $passed > 0;
-          if (empty($checks)) {
-              $checks[] = [
-                  'language' => 'php',
-                  'passed' => $testsPassed,
-                  'message' => $testsPassed
-                      ? "All $passed tests passed"
-                      : ($failed > 0 ? "$failed tests failed" : "No tests found"),
-              ];
-          }
-          file_put_contents('evaluation-results.json', json_encode([
+
+          $results = [
               'score' => $score,
               'passed' => $testsPassed,
-              'checks' => $checks,
-          ], JSON_PRETTY_PRINT));
+              'checks' => $checks ?: [
+                  [
+                      'language' => 'php',
+                      'passed' => $testsPassed,
+                      'message' => $testsPassed
+                          ? "All $passed tests passed"
+                          : ($failed > 0 ? "$failed tests failed" : "No tests found"),
+                  ],
+              ],
+          ];
+
+          file_put_contents('evaluation-results.json', json_encode($results, JSON_PRETTY_PRINT));
+          echo "score={$results['score']}\n";
+          echo "passed=" . ($results['passed'] ? 'true' : 'false') . "\n";
           EOF
-          echo "evaluation_results=1" >> $GITHUB_OUTPUT
+        shell: bash
+        env:
+          GITHUB_OUTPUT: $GITHUB_OUTPUT
 
       - name: Upload result artifact
         if: always()
@@ -158,40 +169,35 @@ jobs:
         if: always()
         shell: bash
         run: |
-          set -e
-          results=$(cat evaluation-results.json)
-          score=$(jq '.score' evaluation-results.json)
-          passed=$(jq '.passed' evaluation-results.json)
-          payload=$(jq -n --arg token "${{ github.event.inputs.attempt_token }}" \
-                           --argjson score "$score" \
-                           --argjson passed "$passed" \
-                           --argjson checks "$(jq '.checks' evaluation-results.json)" \
-                           '{
-                              attempt_token: $token,
-                              status: "completed",
-                              score: $score,
-                              passed: $passed,
-                              feedback: {
-                                earned_points: $score,
-                                total_points: 100,
-                                checks: $checks
-                              }
-                            }')
+          payload=$(cat <<'JSON'
+          {
+            "attempt_token": "${{ github.event.inputs.attempt_token }}",
+            "status": "completed",
+            "score": $(php -r 'echo json_decode(file_get_contents("evaluation-results.json"), true)["score"];'),
+            "passed": $(php -r 'echo json_encode(json_decode(file_get_contents("evaluation-results.json"), true)["passed"]);'),
+            "feedback": {
+              "earned_points": $(php -r 'echo json_decode(file_get_contents("evaluation-results.json"), true)["score"];'),
+              "total_points": 100,
+              "checks": $(php -r 'echo json_encode(json_decode(file_get_contents("evaluation-results.json"), true)["checks"]);')
+            }
+          }
+          JSON
+          )
           signature="sha256=$(printf '%s' "$payload" | openssl dgst -sha256 -hmac "${CALLBACK_SECRET}" | sed 's/^.*= //')"
           response=$(curl -sS -w "%{http_code}" -o /tmp/callback-response.txt \
             -X POST "${ACADEMY_URL}/api/exercises/github-callback" \
             -H "Content-Type: application/json" \
-            -H "X-Academy-Signature: ${signature}" \
+            -H "X-Academy-Signature: $signature" \
             --data "$payload")
-          echo "callback_status=$response" >> $GITHUB_OUTPUT
-          echo "callback_body=$(cat /tmp/callback-response.txt)" >> $GITHUB_OUTPUT
+          echo "callback_status=$response"
+          echo "callback_body=$(cat /tmp/callback-response.txt)"
           if [ "$response" -lt 200 ] || [ "$response" -ge 300 ]; then
             echo "Callback failed: $(cat /tmp/callback-response.txt)"
             exit 1
           fi
 
       - name: Fail workflow if evaluation failed
-        if: always() && steps.results.outputs.evaluation_results == '1' && (jq '.passed' evaluation-results.json) != true
+        if: always() && steps.results.outputs.passed != 'true'
         run: |
-          echo "Evaluation failed: marking workflow failure for GitHub visibility"
+          echo "Evaluation failed; failing workflow for GitHub visibility"
           exit 1

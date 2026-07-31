@@ -33,7 +33,7 @@ permissions:
 
 env:
   ACADEMY_URL: ${{ secrets.ACADEMY_URL }}
-  CALLBACK_SECRET: ${{ secrets.ACADEMY_CALLBACK_SECRET }}
+  ACADEMY_CALLBACK_SECRET: ${{ secrets.ACADEMY_CALLBACK_SECRET }}
   STUDENT_REPOSITORY: ${{ github.event.inputs.student_repository }}
   STUDENT_BRANCH: ${{ github.event.inputs.student_branch }}
   ATTEMPT_TOKEN: ${{ github.event.inputs.attempt_token }}
@@ -55,6 +55,7 @@ jobs:
         id: parse_repo
         shell: bash
         run: |
+          set -euo pipefail
           if [[ "${STUDENT_REPOSITORY}" =~ ^https://github\.com/([^/]+)/([^/]+)(\.git)?$ ]]; then
             echo "owner=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
             echo "repo=${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
@@ -67,38 +68,45 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ steps.parse_repo.outputs.owner }}/${{ steps.parse_repo.outputs.repo }}
+          token: ${{ secrets.GITHUB_TOKEN }}
           ref: ${{ env.STUDENT_BRANCH }}
           path: student-submission
 
       - name: Setup PHP
-        uses: shivammathur/setup-php@v2
+        uses: shivammathur/setup-php@2.37.2
         with:
           php-version: '8.4'
           extensions: mbstring, dom, fileinfo, pdo_sqlite, sqlite3
           coverage: none
 
-      - name: Copy student files to runner
+      - name: Copy student files to runner workspace
         run: |
+          set -euo pipefail
+          mkdir -p app database routes tests || true
           cp -r student-submission/app/* app/ 2>/dev/null || true
           cp -r student-submission/database/* database/ 2>/dev/null || true
           cp -r student-submission/routes/* routes/ 2>/dev/null || true
           cp -r student-submission/tests/* tests/ 2>/dev/null || true
+          ls -la
 
       - name: Install dependencies
         working-directory: student-submission
         run: |
-          composer install --no-interaction --no-progress --prefer-dist
+          set -euo pipefail
+          composer install --no-interaction --no-progress --prefer-dist || true
 
       - name: Create .env file
         working-directory: student-submission
         run: |
+          set -euo pipefail
           cp .env.example .env 2>/dev/null || true
-          php artisan key:generate --force
+          php artisan key:generate --force || true
 
       - name: Run tests
         id: tests
         working-directory: student-submission
         run: |
+          set -euo pipefail
           php artisan test --testdox --json=test-results.json > test-output.txt 2>&1 || true
 
       - name: Process test results
@@ -106,63 +114,76 @@ jobs:
         working-directory: student-submission
         shell: bash
         run: |
-          php <<'EOF'
-          <?php
-          $jsonFile = 'test-results.json';
-          $textFile = 'test-output.txt';
-          $passed = 0;
-          $failed = 0;
-          $checks = [];
+          set -euo pipefail
 
-          if (file_exists($jsonFile)) {
-              $results = json_decode(file_get_contents($jsonFile), true);
-              foreach ($results['tests'] ?? [] as $test) {
-                  if (($test['status'] ?? null) === 'passed') {
-                      $passed++;
-                  } else {
-                      $failed++;
-                      $checks[] = [
-                          'language' => 'php',
-                          'passed' => false,
-                          'message' => $test['name'] ?? 'Test failed',
-                      ];
-                  }
+          # Parse JSON test results if present, fall back to parsing text output.
+          PASSED=0
+          FAILED=0
+          CHECKS_JSON='[]'
+
+          if [ -f test-results.json ]; then
+            # tests file format may vary; handle safely
+            PASSED=$(jq '.tests[] | select(.status=="passed") | .name' -r test-results.json 2>/dev/null | wc -l || true)
+            FAILED=$(jq '.tests[] | select(.status!="passed") | .name' -r test-results.json 2>/dev/null | wc -l || true)
+            # Build simple checks array for failed tests
+            FAILED_NAMES=$(jq -r '.tests[] | select(.status!="passed") | .name' test-results.json 2>/dev/null || true)
+            CHECKS_JSON=$(jq -n '[]')
+            while IFS= read -r t; do
+              [ -z "$t" ] && continue
+              CHECKS_JSON=$(jq -n --arg prev "$CHECKS_JSON" --arg m "$t" '$prev + [{language:"php", passed:false, message:$m}]')
+            done <<EOF
+$FAILED_NAMES
+EOF
+          fi
+
+          if [ -f test-output.txt ]; then
+            # Try to extract numbers from text output if json missing
+            if grep -q 'passed' test-output.txt; then
+              P=$(grep -oP '\d+(?= passed)' test-output.txt | tail -n1 || true)
+              if [ -n "$P" ]; then PASSED=$P; fi
+            fi
+            if grep -q 'failed' test-output.txt; then
+              F=$(grep -oP '\d+(?= failed)' test-output.txt | tail -n1 || true)
+              if [ -n "$F" ]; then FAILED=$F; fi
+            fi
+          fi
+
+          TOTAL=$((PASSED + FAILED))
+          if [ "$TOTAL" -le 0 ]; then
+            SCORE=0
+            TESTS_PASSED=false
+          else
+            SCORE=$(( (PASSED * 100) / TOTAL ))
+            TESTS_PASSED=$([ "$FAILED" -eq 0 ] && echo true || echo false)
+          fi
+
+          # Produce evaluation-results.json (include submission_id & attempt_token)
+          jq -n \
+            --arg submission_id "$SUBMISSION_ID" \
+            --arg attempt_token "$ATTEMPT_TOKEN" \
+            --argjson score "$SCORE" \
+            --argjson passed "$TESTS_PASSED" \
+            --argjson passed_count "$PASSED" \
+            --argjson failed_count "$FAILED" \
+            --arg total_points "100" \
+            --argjson checks "$CHECKS_JSON" \
+            '{
+              submission_id: $submission_id,
+              attempt_token: $attempt_token,
+              score: $score,
+              passed: ($passed | if .==true then true else false end),
+              feedback: {
+                earned_points: $score,
+                total_points: ($total_points | tonumber),
+                passed_count: $passed_count,
+                failed_count: $failed_count,
+                checks: $checks
               }
-          }
+            }' > evaluation-results.json
 
-          if (file_exists($textFile)) {
-              $output = file_get_contents($textFile);
-              if (preg_match('/(\d+) passed/', $output, $m)) {
-                  $passed = (int) $m[1];
-              }
-              if (preg_match('/(\d+) failed/', $output, $m)) {
-                  $failed = (int) $m[1];
-              }
-          }
-
-          $total = max(1, $passed + $failed);
-          $score = (int) (($passed / $total) * 100);
-          $testsPassed = $failed === 0 && $passed > 0;
-
-          $results = [
-              'score' => $score,
-              'passed' => $testsPassed,
-              'feedback' => $checks ?: [
-                  [
-                      'language' => 'php',
-                      'passed' => $testsPassed,
-                      'message' => $testsPassed
-                          ? "All $passed tests passed"
-                          : ($failed > 0 ? "$failed tests failed" : "No tests found"),
-                  ],
-              ],
-          ];
-
-          file_put_contents('evaluation-results.json', json_encode($results, JSON_PRETTY_PRINT));
-          EOF
-
-          echo "score=$(php -r 'echo json_decode(file_get_contents(\"evaluation-results.json\"), true)[\"score\"];')" >> "$GITHUB_OUTPUT"
-          echo "passed=$(php -r 'echo json_decode(file_get_contents(\"evaluation-results.json\", true)[\"passed\"] ? \"true\" : \"false\";')" >> "$GITHUB_OUTPUT"
+          # Expose results to workflow output
+          echo "score=$(jq -r '.score' evaluation-results.json)" >> "$GITHUB_OUTPUT"
+          echo "passed=$(jq -r '.passed' evaluation-results.json)" >> "$GITHUB_OUTPUT"
 
       - name: Upload result artifact
         if: always()
@@ -180,29 +201,47 @@ jobs:
         shell: bash
         env:
           ACADEMY_URL: ${{ secrets.ACADEMY_URL }}
-          CALLBACK_SECRET: ${{ secrets.ACADEMY_CALLBACK_SECRET }}
+          ACADEMY_CALLBACK_SECRET: ${{ secrets.ACADEMY_CALLBACK_SECRET }}
           ATTEMPT_TOKEN: ${{ github.event.inputs.attempt_token }}
         run: |
-          payload=$(jq -c \
-            --arg attempt_token "$ATTEMPT_TOKEN" \
-            --arg status "completed" \
-            '. + {attempt_token: $attempt_token, status: $status}' \
-            evaluation-results.json
-          )
+          set -euo pipefail
 
-          signature="sha256=$(printf '%s' "$payload" | openssl dgst -sha256 -hmac "$CALLBACK_SECRET" | sed 's/^.*= //')"
+          FILE="evaluation-results.json"
+          if [ ! -f "$FILE" ]; then
+            echo "ERROR: $FILE not found in workspace. Listing files:"
+            ls -la
+            exit 1
+          fi
 
-          http_status=$(curl -sS -o /tmp/callback-response.txt -w '%{http_code}' \
-            -X POST "$ACADEMY_URL/api/exercises/github-callback" \
+          echo "===== evaluation-results.json ====="
+          cat "$FILE" || true
+          echo "==================================="
+
+          BODY=$(cat "$FILE")
+          SIG_HEX=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$ACADEMY_CALLBACK_SECRET" -binary | xxd -p -c 256)
+          SIGNATURE="sha256=$SIG_HEX"
+
+          TMP_RESP=$(mktemp)
+          HTTP_CODE=$(curl -sS -w "%{http_code}" -o "$TMP_RESP" \
             -H "Content-Type: application/json" \
-            -H "X-Academy-Signature: $signature" \
-            --data-binary "$payload")
+            -H "X-Academy-Signature: $SIGNATURE" \
+            --data-binary @"$FILE" \
+            "${ACADEMY_URL%/}/api/exercises/github-callback" || true)
+          CURL_RC=$?
 
-          echo "callback_status=$http_status"
-          cat /tmp/callback-response.txt
+          echo "curl exit code: $CURL_RC"
+          echo "---- callback response (truncated) ----"
+          head -n 200 "$TMP_RESP" || true
+          echo "---- end response ----"
+          echo "HTTP status: ${HTTP_CODE:-N/A}"
 
-          if [ "$http_status" -lt 200 ] || [ "$http_status" -ge 300 ]; then
-            echo "Callback failed with status $http_status"
+          if [ "$CURL_RC" -ne 0 ]; then
+            echo "Callback curl failed (exit $CURL_RC)."
+            exit $CURL_RC
+          fi
+
+          if [ -z "$HTTP_CODE" ] || { [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "204" ]; }; then
+            echo "Callback returned non-success HTTP status: ${HTTP_CODE:-N/A}"
             exit 1
           fi
 
